@@ -23,11 +23,14 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 // ── Health check ──────────────────────────────────────────────────────────
 app.get("/health", async () => ({ status: "ok", region: "eu", target: CLOB_TARGET }));
 
-// ── Accept raw body for non-JSON content types ────────────────────────────
-app.addContentTypeParser("*", function (_request, payload, done) {
-  let data = "";
-  payload.on("data", (chunk) => { data += chunk; });
-  payload.on("end", () => { done(null, data); });
+// ── Preserve raw request body for ALL content types ───────────────────────
+// CRITICAL: The CLOB API verifies HMAC signatures against the exact request
+// body bytes. If we let Fastify parse JSON and re-serialize, the key order
+// or spacing may change, breaking the signature. So we capture the raw bytes
+// and forward them untouched.
+app.removeAllContentTypeParsers();
+app.addContentTypeParser("*", { parseAs: "buffer" }, function (_request, body, done) {
+  done(null, body);
 });
 
 // ── Catch-all proxy ───────────────────────────────────────────────────────
@@ -48,18 +51,16 @@ app.all("/*", async (req, reply) => {
       lower === "x-proxy-key" ||
       lower === "connection" ||
       lower === "keep-alive" ||
-      lower === "transfer-encoding" ||
-      lower === "content-length"
+      lower === "transfer-encoding"
     ) continue;
     forwardHeaders[key] = value;
   }
   forwardHeaders["host"] = new URL(CLOB_TARGET).host;
 
-  // Build request body for non-GET/HEAD
+  // Forward the raw body untouched (Buffer) — preserves exact bytes for HMAC
   let requestBody = undefined;
   if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
-    requestBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-    forwardHeaders["content-type"] = forwardHeaders["content-type"] || "application/json";
+    requestBody = req.body; // already a Buffer from our parser
   }
 
   try {

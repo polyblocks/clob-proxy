@@ -9,8 +9,12 @@
  */
 
 import Fastify from "fastify";
+import { Readable } from "node:stream";
 
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: true,
+  bodyLimit: 10 * 1024 * 1024, // 10 MB
+});
 
 const CLOB_TARGET = process.env.CLOB_TARGET || "https://clob.polymarket.com";
 const API_KEY = process.env.API_KEY || "";
@@ -19,10 +23,16 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 // ── Health check ──────────────────────────────────────────────────────────
 app.get("/health", async () => ({ status: "ok", region: "eu", target: CLOB_TARGET }));
 
+// ── Accept raw body for non-JSON content types ────────────────────────────
+app.addContentTypeParser("*", function (_request, payload, done) {
+  let data = "";
+  payload.on("data", (chunk) => { data += chunk; });
+  payload.on("end", () => { done(null, data); });
+});
+
 // ── Catch-all proxy ───────────────────────────────────────────────────────
 app.all("/*", async (req, reply) => {
   // Optional API key check — only enforce on write requests (POST/PUT/DELETE)
-  // GET/HEAD requests are read-only (market data, order book, etc.) and don't need protection
   if (API_KEY && req.method !== "GET" && req.method !== "HEAD" && req.headers["x-proxy-key"] !== API_KEY) {
     return reply.status(401).send({ error: "Unauthorized — invalid X-Proxy-Key" });
   }
@@ -38,36 +48,45 @@ app.all("/*", async (req, reply) => {
       lower === "x-proxy-key" ||
       lower === "connection" ||
       lower === "keep-alive" ||
-      lower === "transfer-encoding"
+      lower === "transfer-encoding" ||
+      lower === "content-length"
     ) continue;
     forwardHeaders[key] = value;
   }
-  // Set correct Host for the target
   forwardHeaders["host"] = new URL(CLOB_TARGET).host;
+
+  // Build request body for non-GET/HEAD
+  let requestBody = undefined;
+  if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+    requestBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+    forwardHeaders["content-type"] = forwardHeaders["content-type"] || "application/json";
+  }
 
   try {
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: forwardHeaders,
-      body: req.method !== "GET" && req.method !== "HEAD"
-        ? JSON.stringify(req.body)
-        : undefined,
+      body: requestBody,
       redirect: "follow",
     });
 
-    // Forward status + headers + body back
+    // Forward response headers (skip problematic ones)
     const responseHeaders = {};
     response.headers.forEach((value, key) => {
-      // Skip hop-by-hop headers
-      if (key === "transfer-encoding" || key === "connection") return;
+      const lower = key.toLowerCase();
+      if (lower === "transfer-encoding" || lower === "connection" || lower === "content-encoding") return;
       responseHeaders[key] = value;
     });
 
-    const body = await response.text();
-    return reply
-      .status(response.status)
-      .headers(responseHeaders)
-      .send(body);
+    // Stream the response body instead of buffering the whole thing
+    reply.status(response.status).headers(responseHeaders);
+
+    if (response.body) {
+      const nodeStream = Readable.fromWeb(response.body);
+      return reply.send(nodeStream);
+    } else {
+      return reply.send("");
+    }
 
   } catch (err) {
     req.log.error(err, "Proxy fetch failed");

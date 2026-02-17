@@ -21,8 +21,9 @@ app.get("/health", async () => ({ status: "ok", region: "eu", target: CLOB_TARGE
 
 // ── Catch-all proxy ───────────────────────────────────────────────────────
 app.all("/*", async (req, reply) => {
-  // Optional API key check
-  if (API_KEY && req.headers["x-proxy-key"] !== API_KEY) {
+  // Optional API key check — only enforce on write requests (POST/PUT/DELETE)
+  // GET/HEAD requests are read-only (market data, order book, etc.) and don't need protection
+  if (API_KEY && req.method !== "GET" && req.method !== "HEAD" && req.headers["x-proxy-key"] !== API_KEY) {
     return reply.status(401).send({ error: "Unauthorized — invalid X-Proxy-Key" });
   }
 
